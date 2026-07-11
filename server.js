@@ -54,10 +54,12 @@ let saves = {};
 try { saves = JSON.parse(fs.readFileSync(SAVE_FILE, 'utf8')); } catch (e) { saves = {}; }
 let saveDirty = false;
 const PERSIST_KEYS = ['cash', 'look', 'name', 'ownedHomes', 'ownedCars', 'ownedBoats', 'furniture', 'weapons', 'ammo', 'wardrobe', 'missionIdx', 'lamboOwned', 'arcadeBonus', 'stats'];
-function persist(token, save) {
-  if (!token || !save) return;
+function persist(token, save, pos) {
+  if (!token) return;
   const cur = saves[token] || {};
-  for (const k of PERSIST_KEYS) if (save[k] !== undefined) cur[k] = save[k];
+  if (save) for (const k of PERSIST_KEYS) if (save[k] !== undefined) cur[k] = save[k];
+  // remember last OUTDOOR world position so a returning player resumes there
+  if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') { cur._x = pos.x; cur._y = pos.y; }
   // heal the old 99M dev wallet so it never persists or tops the board
   if (typeof cur.cash === 'number' && cur.cash > 50000000) cur.cash = 5000;
   cur._ts = Date.now();
@@ -91,7 +93,7 @@ function send(ws, o) { if (ws.readyState === 1) ws.send(JSON.stringify(o)); }
 function broadcast(shard, o, exceptId) { const m = JSON.stringify(o); for (const [id, c] of shard.clients) if (id !== exceptId && c.ws.readyState === 1) c.ws.send(m); }
 
 wss.on('connection', (ws) => {
-  const client = { id: nextId++, ws, shard: null, name: 'PLAYER', token: null, x: 5440, y: 7680, a: 0, car: null, inside: null, hp: 100, dead: false, wanted: 0, look: {}, team: null, role: 'civ', god: false, kills: 0, cash: 0, last: Date.now() };
+  const client = { id: nextId++, ws, shard: null, name: 'PLAYER', token: null, x: 5440, y: 7680, a: 0, car: null, inside: null, hp: 100, dead: false, wanted: 0, look: {}, team: null, role: 'civ', god: false, kills: 0, deaths: 0, ping: 0, cash: 0, last: Date.now(), lastX: null, lastY: null };
 
   ws.on('message', (buf) => {
     let m; try { m = JSON.parse(buf); } catch (e) { return; }
@@ -105,22 +107,45 @@ wss.on('connection', (ws) => {
         client.token = String(m.token || '').slice(0, 40);
         client.look = m.look || {};
         client.god = !!m.god;   // host/tester flag (client-declared; fine for a fun server)
+        // ONE session per player: kick any stale connection with the same token
+        // (this is the "ghost of myself" you see for a moment after a reconnect —
+        // the old socket hadn't been reaped yet). Remove it immediately.
+        if (client.token) {
+          for (const s of shards) {
+            for (const [id, c] of [...s.clients]) {
+              if (c !== client && c.token === client.token) {
+                c.superseded = true;                 // don't let its close handler overwrite fresh save
+                s.clients.delete(id);
+                if (c.role === 'police') s.police = Math.max(0, s.police - 1);
+                try { c.ws.close(); } catch (e) { }
+                broadcast(s, { t: 'leave', id });
+              }
+            }
+          }
+        }
         // police role request, capped per shard
         const shard = pickShard();
         client.shard = shard;
         if (m.role === 'police' && shard.police < POLICE_PER_SHARD) { client.role = 'police'; shard.police++; }
         shard.clients.set(client.id, client);
-        // spawn at a random street position (spread players out)
-        const sp = SPAWNS[(Math.random() * SPAWNS.length) | 0];
-        client.x = sp[0] + (Math.random() * 120 - 60);
-        client.y = sp[1] + (Math.random() * 120 - 60);
         const save = saves[client.token];
+        // returning player → resume at last outdoor spot; otherwise scatter on a street
+        if (save && typeof save._x === 'number' && typeof save._y === 'number') {
+          client.x = save._x; client.y = save._y;
+          client.lastX = save._x; client.lastY = save._y;
+        } else {
+          const sp = SPAWNS[(Math.random() * SPAWNS.length) | 0];
+          client.x = sp[0] + (Math.random() * 120 - 60);
+          client.y = sp[1] + (Math.random() * 120 - 60);
+        }
         send(ws, { t: 'welcome', id: client.id, count: shard.clients.size, role: client.role, spawn: [client.x, client.y], save: save || { empty: true }, time: +worldDayT().toFixed(4), weather: worldWeather });
         break;
       }
       case 'pos': {
         client.x = m.x; client.y = m.y; client.a = m.a; client.car = m.car;
         client.inside = m.inside || null; client.hp = m.hp; client.dead = m.dead; client.wanted = m.wanted || 0;
+        // remember the last OUTDOOR spot (indoors sends room coords, not world)
+        if (!client.inside) { client.lastX = m.x; client.lastY = m.y; }
         break;
       }
       case 'hit': {
@@ -131,7 +156,7 @@ wss.on('connection', (ws) => {
         if (client.role === 'police' && tgt.role !== 'outlaw') break;
         if (client.team && tgt.team && client.team === tgt.team) break;
         send(tgt.ws, { t: 'hit', dmg: Math.min(60, m.dmg | 0), x: m.x, y: m.y, from: client.name });
-        if (tgt.hp - m.dmg <= 0) client.kills++;
+        if (tgt.hp - m.dmg <= 0) { client.kills++; tgt.deaths++; }
         break;
       }
       case 'chat': {
@@ -168,7 +193,7 @@ wss.on('connection', (ws) => {
         }
         break;
       }
-      case 'save': { persist(client.token, m.save); client.cash = (m.save && m.save.cash) || client.cash; break; }
+      case 'save': { persist(client.token, m.save, client.lastX != null ? { x: client.lastX, y: client.lastY } : null); client.cash = (m.save && m.save.cash) || client.cash; break; }
       case 'leaderboard': { send(ws, { t: 'leaderboard', rows: leaderboardFor(client.shard) }); break; }
       case 'role': {
         if (m.role === 'outlaw') client.role = 'outlaw';   // opt into being huntable by police
@@ -181,9 +206,12 @@ wss.on('connection', (ws) => {
   // protocol-level ping/pong so proxies (Render/CF) don't idle us out, and so we
   // can detect half-open sockets. The browser answers pings automatically.
   ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; client.last = Date.now(); });
+  ws.on('pong', () => { ws.isAlive = true; client.last = Date.now(); if (ws._pingAt) client.ping = Date.now() - ws._pingAt; });
 
   ws.on('close', () => {
+    // a superseded ghost was already cleaned up on the new join — and must NOT
+    // write its stale cash/position over the fresh session.
+    if (client.superseded) return;
     const s = client.shard;
     if (s) {
       s.clients.delete(client.id);
@@ -194,7 +222,7 @@ wss.on('connection', (ws) => {
       }
       broadcast(s, { t: 'leave', id: client.id });
     }
-    if (client.token) persist(client.token, { cash: client.cash });
+    if (client.token) persist(client.token, { cash: client.cash }, client.lastX != null ? { x: client.lastX, y: client.lastY } : null);
   });
 });
 
@@ -206,8 +234,9 @@ function sendTeam(shard, team) {
 function leaderboardFor(shard) {
   if (!shard) return [];
   return [...shard.clients.values()]
-    .map(c => ({ name: c.name, kills: c.kills, cash: c.cash, team: c.team, role: c.role }))
-    .sort((a, b) => b.kills - a.kills || b.cash - a.cash)
+    .map(c => ({ name: c.name, kills: c.kills, deaths: c.deaths || 0, cash: c.cash, ping: c.ping || 0, team: c.team, role: c.role }))
+    // stable order: kills desc, then cash desc, then name — so it doesn't shuffle
+    .sort((a, b) => b.kills - a.kills || b.cash - a.cash || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
     .slice(0, 20);
 }
 
@@ -245,6 +274,7 @@ setInterval(() => {
     if (c.ws.readyState !== 1) continue;
     if (c.ws.isAlive === false) { try { c.ws.terminate(); } catch (e) { } continue; }
     c.ws.isAlive = false;
+    c.ws._pingAt = Date.now();
     try { c.ws.ping(); } catch (e) { }
   }
 }, 20000);

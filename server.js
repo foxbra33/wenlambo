@@ -23,6 +23,25 @@ const SHARD_CAP = +(process.env.SHARD_CAP || 500);
 const POLICE_PER_SHARD = +(process.env.POLICE || 50);
 const SAVE_FILE = path.join(__dirname, 'saves.json');
 const TICK_MS = 66;                    // broadcast cadence (~15 Hz)
+const REAP_MS = 45000;                 // drop a socket only after 45s of silence
+const DAY_LEN = 560;                   // seconds per in-game day (matches the client)
+
+// ---- always-running shared world (one clock + one sky for everyone) ----
+// dayT is derived from wall-clock time so it keeps advancing even with nobody
+// online, and survives restarts (tied to absolute time, not process uptime).
+function worldDayT() { return ((Date.now() / 1000) / DAY_LEN) % 1; }
+const WEATHER_KINDS = ['clear', 'clear', 'overcast', 'rain', 'clear', 'storm', 'overcast', 'rain'];
+let worldWeather = 'clear';
+let weatherHold = 120;                 // seconds until the next weather change
+function stepWeather(dtSec) {
+  weatherHold -= dtSec;
+  if (weatherHold <= 0) {
+    weatherHold = 70 + Math.random() * 110;
+    const options = WEATHER_KINDS.filter(k => k !== worldWeather);
+    worldWeather = options[(Math.random() * options.length) | 0];
+  }
+}
+function worldState() { return { t: 'world', time: +worldDayT().toFixed(4), weather: worldWeather }; }
 
 // ---- profanity (mirror of the client filter) ----
 const BAD = ['fuck', 'shit', 'cunt', 'bitch', 'bastard', 'dick', 'piss', 'cock', 'pussy', 'slut', 'whore', 'nigger', 'nigga', 'faggot', 'fag', 'retard', 'rape', 'nazi', 'wank', 'twat', 'bollock', 'arse', 'kkk', 'coon', 'spic', 'chink', 'kike'];
@@ -39,6 +58,8 @@ function persist(token, save) {
   if (!token || !save) return;
   const cur = saves[token] || {};
   for (const k of PERSIST_KEYS) if (save[k] !== undefined) cur[k] = save[k];
+  // heal the old 99M dev wallet so it never persists or tops the board
+  if (typeof cur.cash === 'number' && cur.cash > 50000000) cur.cash = 5000;
   cur._ts = Date.now();
   saves[token] = cur;
   saveDirty = true;
@@ -94,7 +115,7 @@ wss.on('connection', (ws) => {
         client.x = sp[0] + (Math.random() * 120 - 60);
         client.y = sp[1] + (Math.random() * 120 - 60);
         const save = saves[client.token];
-        send(ws, { t: 'welcome', id: client.id, count: shard.clients.size, role: client.role, spawn: [client.x, client.y], save: save || { empty: true } });
+        send(ws, { t: 'welcome', id: client.id, count: shard.clients.size, role: client.role, spawn: [client.x, client.y], save: save || { empty: true }, time: +worldDayT().toFixed(4), weather: worldWeather });
         break;
       }
       case 'pos': {
@@ -153,8 +174,14 @@ wss.on('connection', (ws) => {
         if (m.role === 'outlaw') client.role = 'outlaw';   // opt into being huntable by police
         break;
       }
+      case 'ping': { send(ws, { t: 'pong' }); break; }   // keepalive (client.last already refreshed above)
     }
   });
+
+  // protocol-level ping/pong so proxies (Render/CF) don't idle us out, and so we
+  // can detect half-open sockets. The browser answers pings automatically.
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; client.last = Date.now(); });
 
   ws.on('close', () => {
     const s = client.shard;
@@ -201,11 +228,29 @@ setInterval(() => {
   }
 }, TICK_MS);
 
-// push leaderboard every 5s
-setInterval(() => { for (const shard of shards) { const rows = leaderboardFor(shard); for (const c of shard.clients.values()) send(c.ws, { t: 'leaderboard', rows }); } }, 5000);
+// push leaderboard + the shared world clock/sky every 5s
+setInterval(() => {
+  stepWeather(5);
+  const world = worldState();
+  for (const shard of shards) {
+    const rows = leaderboardFor(shard);
+    for (const c of shard.clients.values()) { send(c.ws, { t: 'leaderboard', rows }); send(c.ws, world); }
+  }
+}, 5000);
 
-// reap dead sockets
-setInterval(() => { const now = Date.now(); for (const shard of shards) for (const [id, c] of shard.clients) if (now - c.last > 30000) { try { c.ws.terminate(); } catch (e) { } } }, 15000);
+// WebSocket keepalive — ping every 20s. Proxies that would otherwise close an
+// "idle" socket see traffic; genuinely dead sockets fail to pong and get reaped.
+setInterval(() => {
+  for (const shard of shards) for (const [id, c] of shard.clients) {
+    if (c.ws.readyState !== 1) continue;
+    if (c.ws.isAlive === false) { try { c.ws.terminate(); } catch (e) { } continue; }
+    c.ws.isAlive = false;
+    try { c.ws.ping(); } catch (e) { }
+  }
+}, 20000);
+
+// reap silent sockets (no pos/ping/pong for REAP_MS)
+setInterval(() => { const now = Date.now(); for (const shard of shards) for (const [id, c] of shard.clients) if (now - c.last > REAP_MS) { try { c.ws.terminate(); } catch (e) { } } }, 15000);
 
 // street spawn points (roads/plazas across the map, in px). Players scatter.
 const SPAWNS = [

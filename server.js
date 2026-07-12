@@ -53,7 +53,7 @@ const cleanChat = s => { let o = String(s); for (const w of BAD) o = o.replace(n
 let saves = {};
 try { saves = JSON.parse(fs.readFileSync(SAVE_FILE, 'utf8')); } catch (e) { saves = {}; }
 let saveDirty = false;
-const PERSIST_KEYS = ['cash', 'look', 'name', 'ownedHomes', 'ownedCars', 'ownedBoats', 'furniture', 'weapons', 'ammo', 'wardrobe', 'missionIdx', 'lamboOwned', 'arcadeBonus', 'stats'];
+const PERSIST_KEYS = ['cash', 'look', 'name', 'ownedHomes', 'ownedCars', 'ownedBoats', 'furniture', 'bedPos', 'weapons', 'ammo', 'wardrobe', 'missionIdx', 'lamboOwned', 'arcadeBonus', 'stats'];
 function persist(token, save, pos) {
   if (!token) return;
   const cur = saves[token] || {};
@@ -105,15 +105,17 @@ wss.on('connection', (ws) => {
         if (!isClean(name)) { send(ws, { t: 'nametaken' }); name = 'PLAYER' + (client.id % 1000); }
         client.name = name;
         client.token = String(m.token || '').slice(0, 40);
+        client.sid = String(m.sid || '').slice(0, 20);
         client.look = m.look || {};
         client.god = !!m.god;   // host/tester flag (client-declared; fine for a fun server)
-        // ONE session per player: kick any stale connection with the same token
-        // (this is the "ghost of myself" you see for a moment after a reconnect —
-        // the old socket hadn't been reaped yet). Remove it immediately.
+        // ONE session per TAB: kick a stale connection only when it's the SAME
+        // tab reconnecting (same token AND same sid). Two tabs / two machines
+        // sharing a token now coexist instead of silently kicking each other —
+        // that kick was the "my friend just vanished" bug.
         if (client.token) {
           for (const s of shards) {
             for (const [id, c] of [...s.clients]) {
-              if (c !== client && c.token === client.token) {
+              if (c !== client && c.token === client.token && (!client.sid || !c.sid || c.sid === client.sid)) {
                 c.superseded = true;                 // don't let its close handler overwrite fresh save
                 s.clients.delete(id);
                 if (c.role === 'police') s.police = Math.max(0, s.police - 1);
@@ -144,8 +146,20 @@ wss.on('connection', (ws) => {
       case 'pos': {
         client.x = m.x; client.y = m.y; client.a = m.a; client.car = m.car;
         client.inside = m.inside || null; client.hp = m.hp; client.dead = m.dead; client.wanted = m.wanted || 0;
+        client.w = m.w || null; client.roof = m.roof || null;
         // remember the last OUTDOOR spot (indoors sends room coords, not world)
-        if (!client.inside) { client.lastX = m.x; client.lastY = m.y; }
+        if (!client.inside && !client.roof) { client.lastX = m.x; client.lastY = m.y; }
+        break;
+      }
+      case 'shot': {
+        // cosmetic gunfire tracer — relay to everyone nearby in the shard
+        if (!client.shard) break;
+        const payload = JSON.stringify({ t: 'shot', x: m.x | 0, y: m.y | 0, a: +m.a || 0, w: String(m.w || 'pistol').slice(0, 12) });
+        for (const [cid, c] of client.shard.clients) {
+          if (cid === client.id || c.ws.readyState !== 1) continue;
+          if (Math.abs(c.x - m.x) > 1700 || Math.abs(c.y - m.y) > 1700) continue;
+          c.ws.send(payload);
+        }
         break;
       }
       case 'hit': {
@@ -193,7 +207,61 @@ wss.on('connection', (ws) => {
         }
         break;
       }
-      case 'save': { persist(client.token, m.save, client.lastX != null ? { x: client.lastX, y: client.lastY } : null); client.cash = (m.save && m.save.cash) || client.cash; break; }
+      // ---- CARNAGE TV online co-op lobbies (arcade relay) ----
+      case 'arc_host': {
+        if (!client.shard) break;
+        arcLeave(client);                              // close anything he was in
+        if (!client.shard.arc) client.shard.arc = new Map();
+        client.shard.arc.set(client.id, { id: client.id, host: client, members: new Map(), state: 'open' });
+        client.arcLobby = client.id; client.arcHost = true;
+        send(ws, { t: 'arc_hosted', lobbyId: client.id });
+        break;
+      }
+      case 'arc_list': {
+        const rows = [];
+        if (client.shard && client.shard.arc) {
+          for (const L of client.shard.arc.values()) {
+            if (L.state === 'open' && L.host.ws.readyState === 1) rows.push({ id: L.id, host: L.host.name, n: L.members.size + 1 });
+          }
+        }
+        send(ws, { t: 'arc_lobbies', rows });
+        break;
+      }
+      case 'arc_join': {
+        const L = client.shard && client.shard.arc && client.shard.arc.get(m.lobbyId);
+        if (!L || L.state !== 'open' || L.members.size >= 3 || client.arcLobby) { send(ws, { t: 'arc_deny', why: !L ? 'gone' : L.state !== 'open' ? 'playing' : 'full' }); break; }
+        L.members.set(client.id, client);
+        client.arcLobby = L.id; client.arcHost = false;
+        send(L.host.ws, { t: 'arc_join', id: client.id, name: client.name, look: client.look });
+        send(ws, { t: 'arc_joined', lobbyId: L.id, host: L.host.name });
+        break;
+      }
+      case 'arc_leave': { arcLeave(client); break; }
+      case 'arc_input': {
+        const L = client.shard && client.shard.arc && client.shard.arc.get(client.arcLobby);
+        if (L && !client.arcHost && L.host.ws.readyState === 1) send(L.host.ws, { t: 'arc_input', id: client.id, i: m.i });
+        break;
+      }
+      case 'arc_state': {
+        const L = client.shard && client.shard.arc && client.shard.arc.get(client.arcLobby);
+        if (L && client.arcHost) {
+          const s = JSON.stringify({ t: 'arc_state', s: m.s });
+          for (const c of L.members.values()) if (c.ws.readyState === 1) c.ws.send(s);
+        }
+        break;
+      }
+      case 'arc_open': {
+        // host flips the lobby between joinable (in the lobby screen) and closed (mid-run)
+        const L = client.shard && client.shard.arc && client.shard.arc.get(client.arcLobby);
+        if (L && client.arcHost) { L.state = m.open ? 'open' : 'playing'; if (m.start) for (const c of L.members.values()) send(c.ws, { t: 'arc_start' }); }
+        break;
+      }
+      case 'save': {
+        persist(client.token, m.save, client.lastX != null ? { x: client.lastX, y: client.lastY } : null);
+        client.cash = (m.save && m.save.cash) || client.cash;
+        if (m.save && m.save.look) client.look = m.save.look;   // wardrobe changes go live
+        break;
+      }
       case 'leaderboard': { send(ws, { t: 'leaderboard', rows: leaderboardFor(client.shard) }); break; }
       case 'role': {
         if (m.role === 'outlaw') client.role = 'outlaw';   // opt into being huntable by police
@@ -212,6 +280,7 @@ wss.on('connection', (ws) => {
     // a superseded ghost was already cleaned up on the new join — and must NOT
     // write its stale cash/position over the fresh session.
     if (client.superseded) return;
+    arcLeave(client);
     const s = client.shard;
     if (s) {
       s.clients.delete(client.id);
@@ -225,6 +294,24 @@ wss.on('connection', (ws) => {
     if (client.token) persist(client.token, { cash: client.cash }, client.lastX != null ? { x: client.lastX, y: client.lastY } : null);
   });
 });
+
+// leave whatever arcade lobby a client hosts or sits in, notifying the rest
+function arcLeave(client) {
+  const s = client.shard;
+  if (!s || !s.arc || !client.arcLobby) { client.arcLobby = null; client.arcHost = false; return; }
+  const L = s.arc.get(client.arcLobby);
+  client.arcLobby = null;
+  const wasHost = client.arcHost;
+  client.arcHost = false;
+  if (!L) return;
+  if (wasHost) {
+    for (const c of L.members.values()) { c.arcLobby = null; c.arcHost = false; send(c.ws, { t: 'arc_closed' }); }
+    s.arc.delete(L.id);
+  } else {
+    L.members.delete(client.id);
+    if (L.host.ws.readyState === 1) send(L.host.ws, { t: 'arc_left', id: client.id });
+  }
+}
 
 function sendTeam(shard, team) {
   const members = team.members.map(id => { const c = shard.clients.get(id); return c ? { id, name: c.name } : null; }).filter(Boolean);
@@ -246,7 +333,7 @@ setInterval(() => {
     if (!shard.clients.size) continue;
     // For big shards, send an interest-managed slice per player (nearby only).
     const all = [...shard.clients.values()];
-    const compact = all.map(c => ({ id: c.id, x: c.x, y: c.y, a: c.a, car: c.car, look: c.look, name: c.name, hp: c.hp, dead: c.dead, team: c.team, inside: c.inside, role: c.role }));
+    const compact = all.map(c => ({ id: c.id, x: c.x, y: c.y, a: c.a, car: c.car, look: c.look, name: c.name, hp: c.hp, dead: c.dead, team: c.team, inside: c.inside, role: c.role, w: c.w || null, roof: c.roof || null }));
     for (const c of all) {
       // send only players within ~2500px (plus everyone if the shard is small)
       let players;

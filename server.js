@@ -53,7 +53,7 @@ const cleanChat = s => { let o = String(s); for (const w of BAD) o = o.replace(n
 let saves = {};
 try { saves = JSON.parse(fs.readFileSync(SAVE_FILE, 'utf8')); } catch (e) { saves = {}; }
 let saveDirty = false;
-const PERSIST_KEYS = ['cash', 'look', 'name', 'ownedHomes', 'ownedCars', 'ownedBoats', 'furniture', 'bedPos', 'weapons', 'ammo', 'wardrobe', 'missionIdx', 'lamboOwned', 'arcadeBonus', 'stats'];
+const PERSIST_KEYS = ['cash', 'look', 'name', 'ownedHomes', 'ownedCars', 'ownedBoats', 'furniture', 'bedPos', 'explored', 'weapons', 'ammo', 'wardrobe', 'missionIdx', 'lamboOwned', 'arcadeBonus', 'stats'];
 function persist(token, save, pos) {
   if (!token) return;
   const cur = saves[token] || {};

@@ -162,6 +162,17 @@ wss.on('connection', (ws) => {
         }
         break;
       }
+      case 'pool': {
+        // lounge pool table: relay table messages to everyone in the shard
+        if (!client.shard || typeof m.m !== 'object' || m.m === null) break;
+        const poolPayload = JSON.stringify({ t: 'pool', from: client.id, m: m.m });
+        if (poolPayload.length > 8192) break;
+        for (const [cid, c] of client.shard.clients) {
+          if (cid === client.id || c.ws.readyState !== 1) continue;
+          c.ws.send(poolPayload);
+        }
+        break;
+      }
       case 'hit': {
         if (!client.shard) break;
         const tgt = client.shard.clients.get(m.target);

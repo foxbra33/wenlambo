@@ -41,7 +41,38 @@ function stepWeather(dtSec) {
     worldWeather = options[(Math.random() * options.length) | 0];
   }
 }
-function worldState() { return { t: 'world', time: +worldDayT().toFixed(4), weather: worldWeather }; }
+// ---- shared WORLD EVENTS (outbreak / invasion / tempest / quake) ----
+// The server owns them exactly like the weather, so every online player lives
+// the same event at the same time. Timed events (tempest/quake) end on a server
+// clock; mission events (outbreak/invasion) run until ANY client reports it done
+// (eventDone) or a failsafe max duration elapses.
+let worldEvent = null;        // { kind, until }  (until = epoch seconds)
+let eventHold = 200;          // seconds until the next roll (a couple minutes in)
+// test hook: WL_FORCE_EVENT=outbreak starts the server with that event live
+if (process.env.WL_FORCE_EVENT) worldEvent = { kind: process.env.WL_FORCE_EVENT, until: Date.now() / 1000 + 9999 };
+function stepEvents(dtSec) {
+  const now = Date.now() / 1000;
+  if (worldEvent && now >= worldEvent.until) worldEvent = null;   // timed end / failsafe
+  if (!worldEvent) {
+    eventHold -= dtSec;
+    if (eventHold <= 0) {
+      eventHold = 300 + Math.random() * 480;                      // roll every ~5–13 min
+      const r = Math.random();
+      let kind = null, dur = 0;
+      if (r < 0.10) { kind = 'outbreak'; dur = 600; }             // failsafe 10 min (client ends on cure)
+      else if (r < 0.19) { kind = 'invasion'; dur = 600; }        // failsafe 10 min (client ends on last saucer)
+      else if (r < 0.35) { kind = 'quake'; dur = 18; }
+      else if (r < 0.68) { kind = 'tempest'; dur = 70; }
+      if (kind) worldEvent = { kind, until: now + dur };
+    }
+  }
+}
+function endWorldEvent(kind) {
+  if (worldEvent && worldEvent.kind === kind) { worldEvent = null; return true; }
+  return false;
+}
+function broadcastWorld() { const w = worldState(); for (const s of shards) for (const c of s.clients.values()) send(c.ws, w); }
+function worldState() { return { t: 'world', time: +worldDayT().toFixed(4), weather: worldWeather, event: worldEvent ? worldEvent.kind : null }; }
 
 // ---- profanity (mirror of the client filter) ----
 const BAD = ['fuck', 'shit', 'cunt', 'bitch', 'bastard', 'dick', 'piss', 'cock', 'pussy', 'slut', 'whore', 'nigger', 'nigga', 'faggot', 'fag', 'retard', 'rape', 'nazi', 'wank', 'twat', 'bollock', 'arse', 'kkk', 'coon', 'spic', 'chink', 'kike'];
@@ -68,6 +99,14 @@ function persist(token, save, pos) {
 }
 setInterval(() => { if (saveDirty) { saveDirty = false; fs.writeFile(SAVE_FILE, JSON.stringify(saves), () => { }); } }, 5000);
 
+// ---- retro arcade hall-of-fame (worldwide top-10 per game) ----
+const RSCORE_FILE = SAVE_FILE.replace(/[^\/]*$/, 'retro_scores.json');
+let rscores = {};
+try { rscores = JSON.parse(fs.readFileSync(RSCORE_FILE, 'utf8')); } catch (e) { rscores = {}; }
+let rscoreDirty = false;
+setInterval(() => { if (rscoreDirty) { rscoreDirty = false; fs.writeFile(RSCORE_FILE, JSON.stringify(rscores), () => { }); } }, 5000);
+const RETRO_GAMES = ['frogger', 'kong', 'pac', 'invaders', 'flappy'];
+
 // ---- shards ----
 let nextId = 1;
 const shards = [];   // each: { id, clients:Map(id->client), teams:Map(name->team) }
@@ -81,7 +120,7 @@ const server = http.createServer((req, res) => {
   if (req.url === '/health') {
     const total = shards.reduce((a, s) => a + s.clients.size, 0);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, players: total, shards: shards.length, cap: SHARD_CAP }));
+    res.end(JSON.stringify({ ok: true, players: total, shards: shards.length, cap: SHARD_CAP, tickMs: +tickMsEMA.toFixed(2) }));
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -93,7 +132,7 @@ function send(ws, o) { if (ws.readyState === 1) ws.send(JSON.stringify(o)); }
 function broadcast(shard, o, exceptId) { const m = JSON.stringify(o); for (const [id, c] of shard.clients) if (id !== exceptId && c.ws.readyState === 1) c.ws.send(m); }
 
 wss.on('connection', (ws) => {
-  const client = { id: nextId++, ws, shard: null, name: 'PLAYER', token: null, x: 5440, y: 7680, a: 0, car: null, inside: null, hp: 100, dead: false, wanted: 0, look: {}, team: null, role: 'civ', god: false, kills: 0, deaths: 0, ping: 0, cash: 0, last: Date.now(), lastX: null, lastY: null };
+  const client = { id: nextId++, ws, shard: null, name: 'PLAYER', token: null, x: 5440, y: 7680, a: 0, car: null, inside: null, hp: 100, dead: false, wanted: 0, look: {}, team: null, role: 'civ', god: false, kills: 0, deaths: 0, ping: 0, cash: 0, last: Date.now(), lastX: null, lastY: null, v: 1, metaRev: 1, metaSent: new Map() };
 
   ws.on('message', (buf) => {
     let m; try { m = JSON.parse(buf); } catch (e) { return; }
@@ -107,6 +146,7 @@ wss.on('connection', (ws) => {
         client.token = String(m.token || '').slice(0, 40);
         client.sid = String(m.sid || '').slice(0, 20);
         client.look = m.look || {};
+        client.v = Math.max(1, m.v | 0) || 1;    // protocol: v2 = binary hot path + meta channel
         client.god = !!m.god;   // host/tester flag (client-declared; fine for a fun server)
         // ONE session per TAB: kick a stale connection only when it's the SAME
         // tab reconnecting (same token AND same sid). Two tabs / two machines
@@ -140,13 +180,17 @@ wss.on('connection', (ws) => {
           client.x = sp[0] + (Math.random() * 120 - 60);
           client.y = sp[1] + (Math.random() * 120 - 60);
         }
-        send(ws, { t: 'welcome', id: client.id, count: shard.clients.size, role: client.role, spawn: [client.x, client.y], save: save || { empty: true }, time: +worldDayT().toFixed(4), weather: worldWeather });
+        send(ws, { t: 'welcome', id: client.id, count: shard.clients.size, role: client.role, spawn: [client.x, client.y], save: save || { empty: true }, time: +worldDayT().toFixed(4), weather: worldWeather, event: worldEvent ? worldEvent.kind : null });
         break;
       }
       case 'pos': {
-        client.x = m.x; client.y = m.y; client.a = m.a; client.car = m.car;
-        client.inside = m.inside || null; client.hp = m.hp; client.dead = m.dead; client.wanted = m.wanted || 0;
-        client.w = m.w || null; client.roof = m.roof || null;
+        // meta fields changing (car entered/left, weapon swap, went inside/up
+        // a roof) bump metaRev so v2 receivers get a fresh meta record
+        const car2 = m.car || null, w2 = m.w || null, roof2 = m.roof || null, inside2 = m.inside || null;
+        if (car2 !== client.car || w2 !== client.w || roof2 !== client.roof || inside2 !== client.inside) client.metaRev++;
+        client.x = m.x; client.y = m.y; client.a = m.a; client.car = car2;
+        client.inside = inside2; client.hp = m.hp; client.dead = m.dead; client.wanted = m.wanted || 0;
+        client.w = w2; client.roof = roof2;
         // remember the last OUTDOOR spot (indoors sends room coords, not world)
         if (!client.inside && !client.roof) { client.lastX = m.x; client.lastY = m.y; }
         break;
@@ -160,6 +204,28 @@ wss.on('connection', (ws) => {
           if (Math.abs(c.x - m.x) > 1700 || Math.abs(c.y - m.y) > 1700) continue;
           c.ws.send(payload);
         }
+        break;
+      }
+      case 'rscores_req': {
+        const g = String(m.g || '').slice(0, 12);
+        if (!RETRO_GAMES.includes(g)) break;
+        client.ws.send(JSON.stringify({ t: 'rscores', g, list: rscores[g] || [] }));
+        break;
+      }
+      case 'rscore': {
+        const g = String(m.g || '').slice(0, 12);
+        if (!RETRO_GAMES.includes(g)) break;
+        const n = (String(m.n || '').replace(/[^A-Za-z0-9 !.]/g, '').slice(0, 6).toUpperCase()) || 'PLAYER';
+        const sc2 = Math.max(0, Math.min(9999999, m.s | 0));
+        if (!sc2) break;
+        const L = rscores[g] = rscores[g] || [];
+        L.push({ n, s: sc2 });
+        L.sort((a, b) => b.s - a.s);
+        rscores[g] = L.slice(0, 10);
+        rscoreDirty = true;
+        // fresh table to everyone online — the whole city sees the new champ
+        const rp = JSON.stringify({ t: 'rscores', g, list: rscores[g] });
+        for (const sh of shards) for (const [, c] of sh.clients) if (c.ws.readyState === 1) c.ws.send(rp);
         break;
       }
       case 'pool': {
@@ -196,6 +262,7 @@ wss.on('connection', (ws) => {
         const team = { name: nm, owner: client.id, members: [client.id] };
         client.shard.teams.set(nm, team);
         client.team = nm;
+        client.metaRev++;
         sendTeam(client.shard, team);
         break;
       }
@@ -214,6 +281,7 @@ wss.on('connection', (ws) => {
         if (team && team.members.length < 4 && !team.members.includes(client.id)) {
           team.members.push(client.id);
           client.team = team.name;
+          client.metaRev++;
           sendTeam(client.shard, team);
         }
         break;
@@ -275,10 +343,16 @@ wss.on('connection', (ws) => {
       }
       case 'leaderboard': { send(ws, { t: 'leaderboard', rows: leaderboardFor(client.shard) }); break; }
       case 'role': {
-        if (m.role === 'outlaw') client.role = 'outlaw';   // opt into being huntable by police
+        if (m.role === 'outlaw') { client.role = 'outlaw'; client.metaRev++; }   // opt into being huntable by police
         break;
       }
       case 'ping': { send(ws, { t: 'pong' }); break; }   // keepalive (client.last already refreshed above)
+      case 'eventDone': {
+        // a client finished the current mission event (cure delivered / all
+        // saucers down) → end it for the whole server right away
+        if (endWorldEvent(m.kind)) broadcastWorld();
+        break;
+      }
     }
   });
 
@@ -301,6 +375,7 @@ wss.on('connection', (ws) => {
         if (team) { team.members = team.members.filter(i => i !== client.id); if (!team.members.length) s.teams.delete(client.team); else sendTeam(s, team); }
       }
       broadcast(s, { t: 'leave', id: client.id });
+      for (const [, c] of s.clients) c.metaSent && c.metaSent.delete(client.id);   // rejoin = fresh meta
     }
     if (client.token) persist(client.token, { cash: client.cash }, client.lastX != null ? { x: client.lastX, y: client.lastY } : null);
   });
@@ -338,26 +413,118 @@ function leaderboardFor(shard) {
     .slice(0, 20);
 }
 
-// broadcast world state to each shard
+// ============================================================
+// BROADCAST — spatial hash + distance-tiered rates + binary hot path
+//   v2 clients (join with v:2) get:
+//     • binary 'state' packets: 17 bytes/player (id,x,y,angle,hp,flags)
+//     • JSON {t:'meta'} packets carrying name/look/car/team/role/w/roof/
+//       inside — sent per-receiver ONLY when that player's meta changed
+//   v1 clients get the original JSON 'state' unchanged.
+//   Interest: spatial hash grid (1250px cells, 5×5 lookup ≈ 2500px radius).
+//   Rates: <1000px every tick (15Hz), 1000–2500px every 3rd tick (5Hz),
+//   staggered by player id so far updates spread across ticks.
+// ============================================================
+const CELL = 1250;
+const NEAR = 1000, FAR = 2500;
+let tickNo = 0;
+let tickMsEMA = 0;    // smoothed tick cost, exposed at /health
+
+// pack the hot fields of a list of players into one binary frame
+// layout: u8 type(0xB1) · u8 flags(bit0=full) · u16 shardCount · u16 n ·
+//         n × { u32 id · f32 x · f32 y · i16 a*1000 · u16 hp · u8 pflags(bit0=dead) }
+function packState(players, shardCount, full) {
+  const buf = Buffer.allocUnsafe(6 + players.length * 17);
+  buf.writeUInt8(0xB1, 0);
+  buf.writeUInt8(full ? 1 : 0, 1);
+  buf.writeUInt16LE(Math.min(shardCount, 65535), 2);
+  buf.writeUInt16LE(players.length, 4);
+  let o = 6;
+  for (const p of players) {
+    buf.writeUInt32LE(p.id >>> 0, o); o += 4;
+    buf.writeFloatLE(+p.x || 0, o); o += 4;
+    buf.writeFloatLE(+p.y || 0, o); o += 4;
+    buf.writeInt16LE(Math.max(-32000, Math.min(32000, Math.round((+p.a || 0) * 1000))), o); o += 2;
+    buf.writeUInt16LE(Math.max(0, Math.min(65535, p.hp | 0)), o); o += 2;
+    buf.writeUInt8(p.dead ? 1 : 0, o); o += 1;
+  }
+  return buf;
+}
+// meta = the slow-changing identity/context fields
+function metaOf(c) {
+  return { id: c.id, name: c.name, look: c.look, team: c.team, role: c.role, car: c.car || null, w: c.w || null, roof: c.roof || null, inside: c.inside || null };
+}
+
 setInterval(() => {
+  const t0 = Date.now();
+  tickNo++;
   for (const shard of shards) {
     if (!shard.clients.size) continue;
-    // For big shards, send an interest-managed slice per player (nearby only).
     const all = [...shard.clients.values()];
-    const compact = all.map(c => ({ id: c.id, x: c.x, y: c.y, a: c.a, car: c.car, look: c.look, name: c.name, hp: c.hp, dead: c.dead, team: c.team, inside: c.inside, role: c.role, w: c.w || null, roof: c.roof || null }));
+    const small = all.length <= 60;
+    // ---- spatial hash: bucket everyone once per tick ----
+    const grid = new Map();
     for (const c of all) {
-      // send only players within ~2500px (plus everyone if the shard is small)
-      let players;
-      if (compact.length <= 60) players = compact;
-      else players = compact.filter(o => o.id === c.id || (Math.abs(o.x - c.x) < 2500 && Math.abs(o.y - c.y) < 2500));
-      send(c.ws, { t: 'state', players, count: shard.clients.size, full: compact.length <= 60 });
+      const k = ((c.x / CELL) | 0) + ',' + ((c.y / CELL) | 0);
+      let cell = grid.get(k);
+      if (!cell) { cell = []; grid.set(k, cell); }
+      cell.push(c);
+    }
+    // v1 compatibility snapshot (built lazily only if a v1 client exists)
+    let compact = null;
+    const getCompact = () => compact || (compact = all.map(c => ({ id: c.id, x: c.x, y: c.y, a: c.a, car: c.car, look: c.look, name: c.name, hp: c.hp, dead: c.dead, team: c.team, inside: c.inside, role: c.role, w: c.w || null, roof: c.roof || null })));
+
+    for (const c of all) {
+      if (c.ws.readyState !== 1) continue;
+      // ---- gather this receiver's visible set ----
+      let vis;
+      if (small) vis = all;
+      else {
+        vis = [];
+        const cx = (c.x / CELL) | 0, cy = (c.y / CELL) | 0;
+        for (let gy = cy - 2; gy <= cy + 2; gy++) for (let gx = cx - 2; gx <= cx + 2; gx++) {
+          const cell = grid.get(gx + ',' + gy);
+          if (!cell) continue;
+          for (const o of cell) {
+            const dx = Math.abs(o.x - c.x), dy = Math.abs(o.y - c.y);
+            if (o === c || (dx < FAR && dy < FAR)) vis.push(o);
+          }
+        }
+      }
+      if (c.v >= 2) {
+        // ---- v2: rate-tier the visible set, meta only on change ----
+        const hot = [];
+        let meta = null;
+        for (const o of vis) {
+          if (o !== c) {
+            const dx = Math.abs(o.x - c.x), dy = Math.abs(o.y - c.y);
+            const far = dx > NEAR || dy > NEAR;
+            if (far && !small && (tickNo + o.id) % 3 !== 0) continue;  // 5Hz tier, staggered
+          }
+          hot.push(o);
+          const sentRev = c.metaSent.get(o.id);
+          if (sentRev !== o.metaRev) {
+            (meta || (meta = [])).push(metaOf(o));
+            c.metaSent.set(o.id, o.metaRev);
+          }
+        }
+        // meta BEFORE state so binary ids always resolve on the client
+        if (meta) send(c.ws, { t: 'meta', ps: meta });
+        try { c.ws.send(packState(hot, shard.clients.size, small)); } catch (e) { }
+      } else {
+        // ---- v1: the original JSON path, byte-for-byte compatible ----
+        const cc = getCompact();
+        const players = small ? cc : cc.filter(o => o.id === c.id || (Math.abs(o.x - c.x) < FAR && Math.abs(o.y - c.y) < FAR));
+        send(c.ws, { t: 'state', players, count: shard.clients.size, full: small });
+      }
     }
   }
+  tickMsEMA = tickMsEMA * 0.9 + (Date.now() - t0) * 0.1;
 }, TICK_MS);
 
 // push leaderboard + the shared world clock/sky every 5s
 setInterval(() => {
   stepWeather(5);
+  stepEvents(5);
   const world = worldState();
   for (const shard of shards) {
     const rows = leaderboardFor(shard);

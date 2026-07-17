@@ -47,24 +47,23 @@ function stepWeather(dtSec) {
 // clock; mission events (outbreak/invasion) run until ANY client reports it done
 // (eventDone) or a failsafe max duration elapses.
 let worldEvent = null;        // { kind, until }  (until = epoch seconds)
-let eventHold = 200;          // seconds until the next roll (a couple minutes in)
+// ONE crisis per in-game DAY (= DAY_LEN seconds), the type chosen at random each
+// time. eventHold counts down only while it's calm.
+const CRISIS_PERIOD = DAY_LEN;
+let eventHold = CRISIS_PERIOD * 0.4;   // first one a bit sooner than a full day
+const EVENT_DUR = { outbreak: 600, invasion: 600, quake: 18, tempest: 70 };  // outbreak/invasion = failsafe (client ends them)
+const EVENT_KINDS = ['outbreak', 'invasion', 'tempest', 'quake'];
 // test hook: WL_FORCE_EVENT=outbreak starts the server with that event live
 if (process.env.WL_FORCE_EVENT) worldEvent = { kind: process.env.WL_FORCE_EVENT, until: Date.now() / 1000 + 9999 };
 function stepEvents(dtSec) {
   const now = Date.now() / 1000;
   if (worldEvent && now >= worldEvent.until) worldEvent = null;   // timed end / failsafe
-  if (!worldEvent) {
-    eventHold -= dtSec;
-    if (eventHold <= 0) {
-      eventHold = 300 + Math.random() * 480;                      // roll every ~5–13 min
-      const r = Math.random();
-      let kind = null, dur = 0;
-      if (r < 0.10) { kind = 'outbreak'; dur = 600; }             // failsafe 10 min (client ends on cure)
-      else if (r < 0.19) { kind = 'invasion'; dur = 600; }        // failsafe 10 min (client ends on last saucer)
-      else if (r < 0.35) { kind = 'quake'; dur = 18; }
-      else if (r < 0.68) { kind = 'tempest'; dur = 70; }
-      if (kind) worldEvent = { kind, until: now + dur };
-    }
+  if (worldEvent) return;                                         // one at a time
+  eventHold -= dtSec;
+  if (eventHold <= 0) {
+    eventHold = CRISIS_PERIOD;
+    const kind = EVENT_KINDS[(Math.random() * EVENT_KINDS.length) | 0];
+    worldEvent = { kind, until: now + (EVENT_DUR[kind] || 90) };
   }
 }
 function endWorldEvent(kind) {
